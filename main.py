@@ -2,7 +2,7 @@ from flask import Flask, request, session, redirect, render_template_string, jso
 from werkzeug.utils import secure_filename
 import sqlite3, time, hashlib, secrets
 import os
-import bot
+import random
 
 
 app = Flask(
@@ -23,7 +23,7 @@ SPECIAL_BADGES = {
     # user_id: ["badge", "badge"]
     2: ["DEV", "FOUNDER", "OG"],
     1: ["OG"],
-    5: ["OG", "Beta Tester", "Marketing"],
+    5: ["OG", "Beta Tester", "Marketing", "Contributor"],
     4: ["DEV"],
     6: ["DEV"],
     7: ["Bot"],
@@ -38,7 +38,8 @@ BADGE_ICONS = {
     "OG": "🔥",
     "Marketing": "📈",
     "Beta Tester": "🪲",
-    "Bot": "🤖"
+    "Bot": "🤖",
+    "Contributor": "💡"
 }
 
 # ---------------- DB ----------------
@@ -98,7 +99,25 @@ with db() as c:
         emoji TEXT,
         UNIQUE(message_id,user_id,emoji)
     );
+    CREATE TABLE IF NOT EXISTS server_state(
+      id INTEGER PRIMARY KEY,
+      enabled INTEGER DEFAULT 1,
+      reason TEXT DEFAULT '',
+      theme TEXT DEFAULT 'default',
+      announcement TEXT DEFAULT ''
+    );
     """)
+
+with db() as c:
+  # ensure there's a state row
+  cur = c.execute("SELECT 1 FROM server_state WHERE id=1").fetchone()
+  if not cur:
+    c.execute("INSERT INTO server_state(id,enabled,reason,theme,announcement) VALUES(1,1,'','default','')")
+  cols = [r[1] for r in c.execute("PRAGMA table_info(server_state)").fetchall()]
+  if "theme" not in cols:
+    c.execute("ALTER TABLE server_state ADD COLUMN theme TEXT DEFAULT 'default'")
+  if "announcement" not in cols:
+    c.execute("ALTER TABLE server_state ADD COLUMN announcement TEXT DEFAULT ''")
 
 with db() as c:
     cols = [r[1] for r in c.execute("PRAGMA table_info(users)").fetchall()]
@@ -220,24 +239,28 @@ def admin_server_control():
     if request.method == "POST":
         enabled = 1 if request.form.get("enabled") == "1" else 0
         reason = request.form.get("reason", "").strip()
+        theme = request.form.get("theme", "default")
+        announcement = request.form.get("announcement", "").strip()
 
         with db() as c:
-            c.execute(
-                "UPDATE server_state SET enabled=?, reason=? WHERE id=1",
-                (enabled, reason)
-            )
+          c.execute(
+            "UPDATE server_state SET enabled=?, reason=?, theme=?, announcement=? WHERE id=1",
+            (enabled, reason, theme, announcement)
+          )
 
         return redirect("/admin/server")
 
     with db() as c:
-        enabled, reason = c.execute(
-            "SELECT enabled, reason FROM server_state WHERE id=1"
-        ).fetchone()
+      enabled, reason, theme, announcement = c.execute(
+        "SELECT enabled, reason, theme, announcement FROM server_state WHERE id=1"
+      ).fetchone()
 
     return render_template_string(
-        SERVER_CONTROL_HTML,
-        enabled=enabled,
-        reason=reason
+      SERVER_CONTROL_HTML,
+      enabled=enabled,
+      reason=reason,
+      theme=theme,
+      announcement=announcement
     )
 
 @app.route("/", methods=["GET","POST"])
@@ -293,7 +316,13 @@ def logout():
 def app_home():
     u=require_user()
     if not u: return redirect("/")
-    return render_template_string(APP_HTML, user=u)
+
+    with db() as c:
+      theme, announcement = c.execute(
+        "SELECT theme, announcement FROM server_state WHERE id=1"
+      ).fetchone()
+
+    return render_template_string(APP_HTML, user=u, theme=theme, announcement=announcement)
 
 @app.route("/notifications")
 def notifications():
@@ -449,6 +478,10 @@ def start_game():
         state = "bbbbbbbb/8/bbbbbbbb/8/8/rrrrrrrr/8/rrrrrrrr"
     elif game == "wordle":
         state = secrets.choice(["apple","grape","brick","smile","plant"])
+    elif game == "ttt":
+        state = "........."  # 9 cells
+    elif game == "guess":
+        state = str(random.randint(1, 100))
     else:
         abort(400)
 
@@ -510,27 +543,87 @@ def ttt_move():
     u = require_user()
     room = int(request.form["room"])
     idx = int(request.form["cell"])
-
-    with db() as c:
-        g = c.execute(
-            "SELECT state,turn FROM games WHERE room_id=? AND game='ttt'",
-            (room,)
+    print(f"TTT move attempt: user={u[0]} room={room} cell={idx}")
+    conn = db()
+    cur = conn.cursor()
+    try:
+      g = cur.execute(
+          "SELECT state,turn,players,status FROM games WHERE room_id=? AND game='ttt'",
+          (room,)
         ).fetchone()
+      if not g:
+        abort(404)
 
-        if not g or g[1] != u[0]:
-            abort(403)
+      state, turn, players_str, status = g
 
-        board = list(g[0])
-        if board[idx] != ".":
-            abort(400)
+      if status != 'active' and status != 'waiting':
+        abort(403)
 
-        board[idx] = "X"
-        c.execute(
-            "UPDATE games SET state=?, turn=0 WHERE room_id=?",
-            ("".join(board), room)
-        )
+      if turn != u[0]:
+        abort(403)
 
-    return jsonify(board=board)
+      players = [p for p in players_str.split(',') if p]
+      if str(u[0]) not in players:
+        abort(403)
+
+      board = list(state)
+      if idx < 0 or idx >= len(board) or board[idx] != '.':
+        abort(400)
+
+      # Determine mark for this player: first player -> X, second -> O
+      mark = 'X' if players.index(str(u[0])) == 0 else 'O'
+      board[idx] = mark
+
+      # Check win conditions
+      wins = [
+        (0,1,2),(3,4,5),(6,7,8),
+        (0,3,6),(1,4,7),(2,5,8),
+        (0,4,8),(2,4,6)
+      ]
+      winner = None
+      for a,b,c in wins:
+        if board[a] != '.' and board[a] == board[b] == board[c]:
+          winner = board[a]
+          break
+
+      new_status = status
+      next_turn = None
+
+      if winner:
+        new_status = 'finished'
+        # find which user won
+        winner_player = None
+        if winner == 'X':
+          winner_player = int(players[0]) if len(players) > 0 else None
+        else:
+          winner_player = int(players[1]) if len(players) > 1 else None
+
+        # optional system message
+        if winner_player:
+          cur.execute("INSERT INTO messages(room_id,user_id,content,ts) VALUES(?,?,?,?)",
+                (room, 0, f"🎉 {winner} wins the game!", time.time()))
+      else:
+        # check draw
+        if '.' not in board:
+          new_status = 'finished'
+          cur.execute("INSERT INTO messages(room_id,user_id,content,ts) VALUES(?,?,?,?)",
+                (room, 0, "It's a draw!", time.time()))
+        else:
+          # switch turn to other player if present
+          if len(players) >= 2:
+            other = players[1] if players[0] == str(u[0]) else players[0]
+            next_turn = int(other)
+          else:
+            next_turn = u[0]
+      cur.execute(
+        "UPDATE games SET state=?, turn=?, status=? WHERE room_id=?",
+        ("".join(board), next_turn or 0, new_status, room)
+      )
+      conn.commit()
+    finally:
+      conn.close()
+
+    return jsonify({"board": "".join(board), "status": new_status, "winner": winner, "turn": next_turn or 0})
 
 @app.route("/api/game/guess", methods=["POST"])
 def guess():
@@ -1209,6 +1302,7 @@ LOGIN_HTML = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Relay • Login</title>
+<link rel="apple-touch-icon" href="/static/685887l.png">
 <link rel="icon" href="https://cdn-icons-png.flaticon.com/512/685/685887.png">
 
 <style>
@@ -1487,6 +1581,7 @@ APP_HTML = """
 <head>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <link rel="icon" href="https://cdn-icons-png.flaticon.com/512/685/685887.png" type="image/x-icon">
+<link rel="apple-touch-icon" href="/static/685887l.png">
 <title>Relay App</title>
 <style>
 :root{
@@ -1504,6 +1599,9 @@ APP_HTML = """
 
   --border:#1e293b;
   --glow:0 0 12px rgba(56,189,248,.35);
+  --acc1: rgba(56,189,246,.15);
+  --acc2: rgba(14,165,233,.12);
+  --acc3: rgba(2,132,199,.08);
 }
 
 /* ---------- ANIMATED BACKGROUND ---------- */
@@ -1514,9 +1612,9 @@ body::after{
   inset:-50%;
   z-index:-1;
   background:
-    radial-gradient(circle at 20% 30%, rgba(56,189,248,.15), transparent 40%),
-    radial-gradient(circle at 80% 70%, rgba(14,165,233,.12), transparent 45%),
-    radial-gradient(circle at 50% 50%, rgba(2,132,199,.08), transparent 50%);
+    radial-gradient(circle at 20% 30%, var(--acc1), transparent 40%),
+    radial-gradient(circle at 80% 70%, var(--acc2), transparent 45%),
+    radial-gradient(circle at 50% 50%, var(--acc3), transparent 50%);
   animation:floatBg 40s linear infinite;
 }
 
@@ -1541,7 +1639,16 @@ body{
   background:#313338;
   color:white;
   font-family:"Trebuchet MS";
-  overflow:hidden;
+  overflow:auto;
+}
+
+@media (max-width: 900px) {
+  /* Allow the page to scroll on mobile so inner scrollable regions receive touch events */
+  body {
+    overflow: auto;
+    height: 100dvh;
+    -webkit-overflow-scrolling: touch;
+  }
 }
 
 /* ---------- LEFT SIDEBAR ---------- */
@@ -1662,7 +1769,122 @@ body{
 .messages{
   flex:1;
   overflow-y:auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  touch-action: pan-y;
   padding:10px;
+}
+
+/* ---------- THEMES & ANNOUNCEMENTS ---------- */
+.announcement{
+  background:linear-gradient(90deg,#2b2d31,#232428);
+  color:#dbeafe;
+  padding:8px 12px;
+  text-align:center;
+  border-bottom:1px solid rgba(255,255,255,0.03);
+  font-weight:600;
+}
+
+.theme-snow{ }
+
+.theme-rain::before{
+  content:"";
+  position:fixed;inset:0;pointer-events:none;z-index:500;
+  background-image: linear-gradient(rgba(255,255,255,0.03) 1px, rgba(255,255,255,0) 1px);
+  background-size:2px 18px;
+  opacity:0.14;
+  animation: rainFall .6s linear infinite;
+}
+
+@keyframes rainFall{from{background-position:0 0}to{background-position:0 36px}}
+
+.theme-autumn::before{
+  content:"";
+  position:fixed;inset:0;pointer-events:none;z-index:500;
+  background: radial-gradient(circle at 10% 10%, rgba(255,173,51,0.04), transparent 20%),
+              radial-gradient(circle at 90% 80%, rgba(255,99,71,0.03), transparent 25%);
+  opacity:0.9;
+}
+
+/* Autumn page background overrides to better match warm tones */
+.theme-autumn body::before,
+.theme-autumn body::after{
+  background:
+    radial-gradient(circle at 10% 20%, rgba(255,170,102,0.08), transparent 20%),
+    radial-gradient(circle at 80% 80%, rgba(194,118,54,0.06), transparent 25%);
+  filter: blur(18px);
+}
+
+/* leaf pile */
+.leafPile{
+  position:fixed;
+  right:18px;
+  bottom:6px;
+  z-index:530;
+  pointer-events:none;
+  font-size:20px;
+  opacity:0.9;
+  transform:translateY(2px);
+  width:120px;
+  height:48px;
+  display:block;
+}
+
+.leafPile span{
+  position:absolute;
+  bottom:0;
+  display:block;
+}
+
+@keyframes leafDrift{
+  0%{transform:translateY(-10vh) translateX(0) rotate(0deg); opacity:0}
+  10%{opacity:1}
+  50%{transform:translateY(40vh) translateX(20px) rotate(180deg)}
+  100%{transform:translateY(110vh) translateX(40px) rotate(540deg); opacity:0.9}
+}
+
+/* Theme color overrides */
+.theme-autumn{
+  --bg-main: #241613;
+  --bg-panel: #2b1f1c;
+  --bg-hover: #3a2a24;
+  --blue: #f6ad55; /* accent becomes warm */
+  --blue-dark: #b5651d;
+  --acc1: rgba(255,170,102,0.12);
+  --acc2: rgba(194,118,54,0.10);
+  --acc3: rgba(255,120,60,0.06);
+}
+
+.theme-snow{
+  --bg-main:#071427;
+  --bg-panel:#071726;
+  --blue:#cfe9ff;
+  --blue-dark:#9fd7ff;
+}
+
+.theme-rain{
+  --bg-main:#08151b;
+  --bg-panel:#0b1b22;
+  --blue:#7fb3d5;
+  --blue-dark:#256d85;
+}
+
+/* Autumn leaf style and animation */
+.leaf{
+  position:fixed;
+  top:-40px;
+  pointer-events:none;
+  font-size:20px;
+  opacity:0.95;
+  filter:drop-shadow(0 2px 4px rgba(0,0,0,0.35));
+  transform-origin:center;
+  z-index:520;
+}
+
+@keyframes leafFall{
+  0%{transform:translateY(-10vh) rotate(0deg); opacity:0}
+  10%{opacity:1}
+  100%{transform:translateY(110vh) translateX(40px) rotate(720deg); opacity:0.9}
 }
 
 .msg{margin-bottom:10px}
@@ -1909,6 +2131,9 @@ body.phone .main{
 
   .messages{
     padding-bottom:80px;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
+    touch-action: pan-y;
   }
 
   .input{
@@ -1989,6 +2214,9 @@ box-shadow:0 10px 30px rgba(0,0,0,.6);
       </div>
     </div>
 
+    {% if announcement %}
+    <div class="announcement">{{ announcement }}</div>
+    {% endif %}
     <div class="messages" id="msgs"></div>
     <div class="typing" id="typing"></div>
 
@@ -2076,6 +2304,9 @@ box-shadow:0 10px 30px rgba(0,0,0,.6);
   .messages{
     padding:12px 10px 96px;
     scroll-behavior:smooth;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
+    touch-action: pan-y;
   }
 
   .input{
@@ -2175,9 +2406,15 @@ display:none;
 flex-direction:column;
 animation:pop .25s ease;
 z-index:999;">
-  <div style="padding:12px;border-bottom:1px solid #404249">
-    <b id="gameTitle"></b>
-    <span id="turnInfo" style="float:right;color:#b5bac1"></span>
+  <div style="padding:12px;border-bottom:1px solid #404249;display:flex;align-items:center;justify-content:space-between;gap:12px">
+    <div style="display:flex;flex-direction:column;">
+      <b id="gameTitle"></b>
+      <span id="markInfo" style="font-size:12px;color:#b5bac1">&nbsp;</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;">
+      <span id="turnInfo" style="color:#b5bac1"></span>
+      <button onclick="closeGameUI()" style="background:none;border:none;color:#b5bac1;font-size:18px;cursor:pointer">✕</button>
+    </div>
   </div>
   <div id="gameBoard" style="flex:1;padding:12px"></div>
 </div>
@@ -2197,6 +2434,189 @@ z-index:999;">
 
 <script>
   const myId = {{ user[0] }};
+</script>
+
+<script>
+  (function(){
+    const theme = "{{ theme }}" || 'default';
+    try{
+      if(theme && theme !== 'default') document.documentElement.classList.add('theme-'+theme);
+    }catch(e){}
+  })();
+</script>
+
+<script>
+function closeGameUI(){
+  const ui = document.getElementById('gameUI');
+  ui.style.display='none';
+  // clear currentGame
+  window.currentGame = null;
+}
+</script>
+
+<script>
+  // Add subtle particle effects for snow, rain, and occasional autumn leaves
+  (function(){
+    const theme = "{{ theme }}" || 'default';
+
+    function createCanvas(){
+      const c = document.createElement('canvas');
+      c.style.position='fixed';
+      c.style.left='0'; c.style.top='0';
+      c.style.width='100%'; c.style.height='100%';
+      c.style.pointerEvents='none';
+      c.style.zIndex=510;
+      c.width = innerWidth;
+      c.height = innerHeight;
+      document.body.appendChild(c);
+      return c;
+    }
+
+    function initSnow(){
+      const canvas = createCanvas();
+      const ctx = canvas.getContext('2d');
+      let flakes = [];
+      const COUNT = Math.max(12, Math.floor((window.innerWidth/600)*18));
+
+      function reset(){
+        flakes = [];
+        for(let i=0;i<COUNT;i++){
+          flakes.push({
+            x: Math.random()*canvas.width,
+            y: Math.random()*canvas.height,
+            r: 1+Math.random()*3,
+            d: 0.5 + Math.random()*1.5,
+            sway: Math.random()*2*Math.PI
+          });
+        }
+      }
+
+      function step(){
+        ctx.clearRect(0,0,canvas.width,canvas.height);
+        ctx.fillStyle = 'rgba(255,255,255,0.85)';
+        flakes.forEach(f=>{
+          ctx.beginPath();
+          ctx.moveTo(f.x,f.y);
+          ctx.arc(f.x,f.y,f.r,0,Math.PI*2);
+          ctx.fill();
+          f.y += f.d;
+          f.x += Math.sin((f.y/10)+f.sway) * 0.6;
+          if(f.y > canvas.height + 10){ f.y = -10; f.x = Math.random()*canvas.width; }
+        });
+        requestAnimationFrame(step);
+      }
+
+      window.addEventListener('resize', ()=>{ canvas.width=innerWidth; canvas.height=innerHeight; reset(); });
+      reset(); step();
+    }
+
+    function initRain(){
+      const canvas = createCanvas();
+      const ctx = canvas.getContext('2d');
+      let drops = [];
+      let splashes = [];
+      const COUNT = Math.max(10, Math.floor((window.innerWidth/600)*90));
+
+      function reset(){
+        drops = [];
+        splashes = [];
+        for(let i=0;i<COUNT;i++){
+          drops.push({
+            x: Math.random()*canvas.width,
+            y: Math.random()*canvas.height,
+            l: 10 + Math.random()*18,
+            s: 8 + Math.random()*12,
+            a: 0.12 + Math.random()*0.18
+          });
+        }
+      }
+
+      function step(){
+        ctx.clearRect(0,0,canvas.width,canvas.height);
+        // draw drops
+        ctx.strokeStyle = 'rgba(200,220,255,0.18)';
+        ctx.lineWidth = 1.2;
+        drops.forEach(d=>{
+          ctx.beginPath();
+          ctx.moveTo(d.x, d.y);
+          ctx.lineTo(d.x + d.l*0.2, d.y + d.l);
+          ctx.stroke();
+          d.x += d.s*0.03;
+          d.y += d.s*0.99;
+          // when reaching bottom, spawn splash
+          if(d.y > canvas.height - 6){
+            splashes.push({x: d.x, y: canvas.height - 6, r: 1 + Math.random()*2, life: 1, max: 8 + Math.random()*12});
+            d.y = -20; d.x = Math.random()*canvas.width;
+          }
+        });
+
+        // draw splashes
+        for(let i=splashes.length-1;i>=0;i--){
+          const s = splashes[i];
+          ctx.beginPath();
+          ctx.strokeStyle = `rgba(200,220,255,${0.25 * s.life})`;
+          ctx.lineWidth = 1;
+          ctx.arc(s.x, s.y, s.r + (1 - s.life) * s.max, 0, Math.PI);
+          ctx.stroke();
+          s.life -= 0.06;
+          if(s.life <= 0) splashes.splice(i,1);
+        }
+
+        requestAnimationFrame(step);
+      }
+
+      window.addEventListener('resize', ()=>{ canvas.width=innerWidth; canvas.height=innerHeight; reset(); });
+      reset(); step();
+    }
+
+    function initAutumn(){
+      // refined falling leaves using CSS animation and a small pile
+      function ensurePile(){
+        if(document.querySelector('.leafPile')) return;
+        const pile = document.createElement('div');
+        pile.className = 'leafPile';
+        const leaves = ['🍁','🍂','🍂','🍁','🍂'];
+        // create layered spans to resemble a small pile
+        leaves.forEach((l,i)=>{
+          const s = document.createElement('span');
+          const size = 12 + Math.floor(Math.random()*14);
+          s.textContent = l;
+          s.style.fontSize = size + 'px';
+          s.style.left = (10 + i*14 + (Math.random()*8-4)) + 'px';
+          s.style.transform = `rotate(${(Math.random()*40-20)}deg)`;
+          s.style.opacity = 0.9 - i*0.08;
+          s.style.zIndex = 1 + i;
+          pile.appendChild(s);
+        });
+        document.body.appendChild(pile);
+      }
+
+      function spawnLeaf(){
+        const leaf = document.createElement('div');
+        leaf.className = 'leaf';
+        const variants = ['🍂','🍁','🍃'];
+        leaf.textContent = variants[Math.floor(Math.random()*variants.length)];
+        const startX = Math.random()*window.innerWidth;
+        leaf.style.left = (startX)+'px';
+        leaf.style.fontSize = (12 + Math.random()*30) + 'px';
+        leaf.style.opacity = 0.85 * (0.6 + Math.random()*0.6);
+        const duration = 6000 + Math.random()*9000;
+        leaf.style.animation = `leafDrift ${duration}ms linear forwards`;
+        leaf.style.willChange = 'transform,opacity';
+        document.body.appendChild(leaf);
+        setTimeout(()=>{ leaf.remove(); }, duration+400 );
+      }
+
+      ensurePile();
+      setInterval(()=>{ if(Math.random() < 0.45) spawnLeaf(); }, 700);
+    }
+
+    try{
+      if(theme === 'snow') initSnow();
+      else if(theme === 'rain') initRain();
+      else if(theme === 'autumn') initAutumn();
+    }catch(e){console.error(e)}
+  })();
 </script>
 
 <script>
@@ -2281,7 +2701,7 @@ gamePopup.style.display='none';
 }
 
 function showGames1(){
-  if(!currentRoom) return;
+  if(!room) return;
 
   fetch(`/api/game/list/${room}`)
     .then(r=>r.json())
@@ -2313,25 +2733,25 @@ function showGames1(){
 }
 
 function startGame(game){
+  if(!room) return;
   fetch("/api/game/start",{
     method:"POST",
     headers:{"Content-Type":"application/x-www-form-urlencoded"},
-    body:`room=${currentRoom}&game=${game}`
-  }).then(()=>location.reload());
+    body:`room=${room}&game=${game}`
+  }).then(()=>{ hideGames(); openGame(); });
 }
 
 function joinGame() {
+  if(!room) return;
   fetch("/api/game/join", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded"
-    },
-    body: `room=${currentRoom}`
+    headers: {"Content-Type": "application/x-www-form-urlencoded"},
+    body: `room=${room}`
   })
   .then(r => r.json())
   .then(() => {
-    closeGamePopup();
-    loadGameState();   // refresh UI without reloading page
+    hideGames();
+    openGame();   // refresh UI without reloading page
   });
 }
 
@@ -2340,11 +2760,23 @@ async function openGame(){
 
   gameUI.style.display='flex';
   gameTitle.textContent = g.game.toUpperCase();
-  turnInfo.textContent = g.turn == myId ? "Your turn" : "Opponent's turn";
+  // store current game and mark (coerce IDs to numbers)
+  window.currentGame = g;
+  window.currentGame.turn = Number(g.turn || 0);
+  const players = (g.players || []).map(x=>Number(x));
+  const myIdNum = Number(myId);
+  window.myMark = null;
+  if(players.indexOf(myIdNum) !== -1){
+    window.myMark = players.indexOf(myIdNum) === 0 ? 'X' : 'O';
+  }
+
+  document.getElementById('markInfo').textContent = window.myMark ? ('Mark: ' + window.myMark) : '';
+  document.getElementById('turnInfo').textContent = window.currentGame.turn == myIdNum ? "Your turn" : "Opponent's turn";
 
   if(g.game === "wordle") renderWordle();
   if(g.game === "chess") renderChess(g.state);
   if(g.game === "checkers") renderCheckers(g.state);
+  if(g.game === "ttt") renderTTT(g);
 }
 
 function renderWordle(){
@@ -2365,6 +2797,68 @@ function renderWordle(){
   }
 }
 
+function renderTTT(g){
+  gameBoard.innerHTML = '';
+  const state = g.state || '.........';
+  const board = state.split('');
+  const grid = document.createElement('div');
+  grid.style.display='grid';
+  grid.style.gridTemplateColumns='repeat(3, 64px)';
+  grid.style.gridGap='8px';
+  grid.style.justifyContent='center';
+
+  board.forEach((cell, i)=>{
+    const c = document.createElement('div');
+    c.className='cell';
+    c.style.width='64px';
+    c.style.height='64px';
+    c.style.display='flex';
+    c.style.alignItems='center';
+    c.style.justifyContent='center';
+    c.style.fontSize='28px';
+    c.style.border='2px solid #444';
+    c.style.borderRadius='8px';
+    c.style.background = cell === '.' ? 'transparent' : 'rgba(0,0,0,0.15)';
+    c.textContent = cell === '.' ? '' : cell;
+    if(cell === 'X') c.style.color = 'var(--blue)';
+    if(cell === 'O') c.style.color = 'var(--blue-dark)';
+
+    c.onclick = async ()=>{
+      const myIdNum = Number(myId);
+      console.log('TTT click', i, 'currentTurn', window.currentGame && window.currentGame.turn, 'myId', myIdNum);
+      if(!window.currentGame) return;
+      if(window.currentGame.status === 'finished') return;
+      if(Number(window.currentGame.turn) !== myIdNum) return;
+      if(c.textContent) return;
+      try{
+        const res = await fetch('/api/game/ttt', {
+          method:'POST',
+          headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+          body: new URLSearchParams({ room: room, cell: i })
+        }).then(async r=>{
+          if(!r.ok){
+            const txt = await r.text();
+            throw new Error('Server error: '+txt);
+          }
+          return r.json();
+        });
+
+        // refresh board
+        // update global state and UI
+        window.currentGame.state = res.board;
+        window.currentGame.status = res.status;
+        window.currentGame.turn = res.turn || 0;
+        document.getElementById('turnInfo').textContent = window.currentGame.turn == myId ? 'Your turn' : (res.status === 'finished' ? (res.winner ? (res.winner + ' wins') : 'Draw') : "Opponent's turn");
+        renderTTT(window.currentGame);
+      }catch(e){ console.error('TTT move error', e); }
+    };
+
+    grid.appendChild(c);
+  });
+
+  gameBoard.appendChild(grid);
+}
+
 function renderChess(state){
   gameBoard.innerHTML='';
   let rows = state.split('/');
@@ -2381,6 +2875,28 @@ function renderChess(state){
     }
     gameBoard.appendChild(row);
   });
+}
+
+function renderCheckers(state){
+  // simple checkers board placeholder (8x8)
+  gameBoard.innerHTML='';
+  const board = document.createElement('div');
+  board.style.display='grid';
+  board.style.gridTemplateColumns='repeat(8, 40px)';
+  board.style.gridGap='2px';
+
+  // state may be a simple string; if not, draw empty board
+  for(let i=0;i<64;i++){
+    const cell = document.createElement('div');
+    const x = i % 8;
+    const y = Math.floor(i/8);
+    const dark = (x+y) % 2 === 1;
+    cell.style.width='40px'; cell.style.height='40px';
+    cell.style.background = dark ? '#7a5230' : '#e9cfa8';
+    board.appendChild(cell);
+  }
+
+  gameBoard.appendChild(board);
 }
 
 setInterval(()=>{
@@ -2513,6 +3029,12 @@ async function loadMembers(){
       }
     else if(b == '🤖'){
       d.innerHTML+=' <span class="badge" data-tip="Bot">'+b+'</span>';
+      }
+    else if(b == '💡'){
+      d.innerHTML+=' <span class="badge" data-tip="Contributor">'+b+'</span>';
+      }
+    else if(b == '📈'){
+      d.innerHTML+=' <span class="badge" data-tip="Marketer">'+b+'</span>';
       }
     else{
       d.innerHTML+=' <span class="badge" data-tip="'+b+'">'+b+'</span>';
@@ -2886,6 +3408,17 @@ textarea{
     <label>Disable reason</label>
     <textarea name="reason">{{ reason }}</textarea>
 
+    <label style="margin-top:8px">Theme</label>
+    <select name="theme" style="width:100%;padding:8px;border-radius:6px;margin:6px 0;background:#1e1f22;color:white;border:none">
+      <option value="default" {{ 'selected' if theme=='default' else '' }}>Default</option>
+      <option value="snow" {{ 'selected' if theme=='snow' else '' }}>Snow</option>
+      <option value="rain" {{ 'selected' if theme=='rain' else '' }}>Rain</option>
+      <option value="autumn" {{ 'selected' if theme=='autumn' else '' }}>Autumn</option>
+    </select>
+
+    <label style="margin-top:8px">Announcement (shown to all users)</label>
+    <textarea name="announcement">{{ announcement }}</textarea>
+
     <input type="hidden" name="enabled" value="{{ 0 if enabled else 1 }}">
 
     {% if enabled %}
@@ -2899,7 +3432,6 @@ textarea{
   <a href="/admin" style="color:#aaa">← Back to Admin</a>
 </div>
 """
-
 
 if __name__=="__main__":
     app.run(debug=True,host="0.0.0.0",port=5001)
