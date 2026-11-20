@@ -774,18 +774,164 @@ def create_invite(rid):
         c.execute("INSERT INTO invites VALUES(?,?,?)",(token,rid,time.time()+86400))
     return jsonify(link=f"/invite/{token}")
 
+from flask import redirect, render_template_string
+import time
+
+EXPIRED_INVITE_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Invite Expired — Relay</title>
+    <style>
+        :root {
+            --bg-dark: #090d16;
+            --card-bg: #111827;
+            --border-color: #1e293b;
+            --primary: #2196F3;
+            --primary-hover: #1976D2;
+            --primary-glow: rgba(33, 150, 243, 0.25);
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --danger: #ef4444;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        }
+
+        body {
+            background-color: var(--bg-dark);
+            background-image: 
+                radial-gradient(circle at 50% 0%, rgba(33, 150, 243, 0.12) 0%, transparent 50%),
+                radial-gradient(circle at 85% 90%, rgba(0, 123, 255, 0.08) 0%, transparent 40%);
+            color: var(--text-main);
+            height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 1.5rem;
+        }
+
+        .card {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 2.75rem 2.25rem;
+            max-width: 420px;
+            width: 100%;
+            text-align: center;
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.03);
+            animation: fadeIn 0.35s ease-out;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .brand {
+            font-size: 0.85rem;
+            font-weight: 700;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            color: var(--primary);
+            margin-bottom: 1.5rem;
+        }
+
+        .icon-wrapper {
+            width: 68px;
+            height: 68px;
+            margin: 0 auto 1.5rem;
+            border-radius: 50%;
+            background: rgba(33, 150, 243, 0.1);
+            border: 1px solid rgba(33, 150, 243, 0.25);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 0 24px var(--primary-glow);
+        }
+
+        .icon-wrapper svg {
+            width: 32px;
+            height: 32px;
+            stroke: var(--primary);
+        }
+
+        h1 {
+            font-size: 1.5rem;
+            font-weight: 700;
+            margin-bottom: 0.65rem;
+            letter-spacing: -0.02em;
+        }
+
+        p {
+            color: var(--text-muted);
+            font-size: 0.95rem;
+            line-height: 1.55;
+            margin-bottom: 2rem;
+        }
+
+        .btn {
+            display: inline-block;
+            width: 100%;
+            padding: 0.85rem 1.5rem;
+            background-color: var(--primary);
+            color: #ffffff;
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 0.95rem;
+            border-radius: 10px;
+            transition: all 0.2s ease;
+            box-shadow: 0 4px 14px var(--primary-glow);
+        }
+
+        .btn:hover {
+            background-color: var(--primary-hover);
+            transform: translateY(-1px);
+            box-shadow: 0 6px 20px rgba(33, 150, 243, 0.4);
+        }
+
+        .btn:active {
+            transform: translateY(0);
+        }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="brand">Relay</div>
+        <div class="icon-wrapper">
+            <!-- Broken Link / Expired Clock SVG Icon -->
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="10"></circle>
+                <polyline points="12 6 12 12 16 14"></polyline>
+            </svg>
+        </div>
+        <h1>Invite Link Expired</h1>
+        <p>This invite link is no longer valid or has reached its time limit. Ask a room member to generate a fresh link for you.</p>
+        <a href="/app" class="btn">Back to Relay</a>
+    </div>
+</body>
+</html>
+"""
+
 @app.route("/invite/<token>")
 def invite(token):
-    u=require_user()
-    if not u: return redirect("/")
+    u = require_user()
+    if not u: 
+        return redirect("/")
     with db() as c:
-        r=c.execute(
-            "SELECT room_id,expires FROM invites WHERE token=?",
+        r = c.execute(
+            "SELECT room_id, expires FROM invites WHERE token=?",
             (token,)
         ).fetchone()
-        if not r or r[1]<time.time():
-            return "Invite expired",400
-        c.execute("INSERT OR IGNORE INTO room_members VALUES(?,?)",(r[0],u[0]))
+        if not r or r[1] < time.time():
+            return render_template_string(EXPIRED_INVITE_HTML), 400
+        c.execute("INSERT OR IGNORE INTO room_members VALUES(?, ?)", (r[0], u[0]))
     return redirect("/app")
 
 # ---------------- Messages ----------------
